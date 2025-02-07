@@ -6,3 +6,4 @@ scikit-learn
 ccxt
 nest_asyncio
 scipy
+statsmodels
