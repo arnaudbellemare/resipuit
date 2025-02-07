@@ -23,8 +23,10 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Set page configuration and custom CSS for styling
+# Streamlit Configuration
 st.set_page_config(page_title="Market-Making Portfolio Hedging Explorer", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS Styling
 st.markdown("""
 <style>
 .stApp {
@@ -58,7 +60,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar inputs for pipeline parameters
+# Sidebar Inputs for Pipeline Parameters
 st.sidebar.header("Pipeline Parameters")
 frac_diff_d = st.sidebar.slider("Fractional Differencing Parameter (d)", min_value=0.0, max_value=1.0, value=0.8, step=0.05)
 rolling_window = st.sidebar.number_input("Rolling Window Size for PCA", min_value=10, max_value=100, value=28, step=1)
@@ -66,12 +68,11 @@ data_limit = st.sidebar.number_input("Number of Data Points", min_value=30, max_
 timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=6)
 ekf_q_scale = st.sidebar.number_input("EKF Q Scale", value=1e-3, format="%.4e")
 ekf_r_scale = st.sidebar.number_input("EKF R Scale", value=1e-3, format="%.4e")
+bias_penalty = st.sidebar.number_input("Bias Penalty Weight", value=10.0, step=1.0)
 
-# -------------------------------
 # Utility Functions
-# -------------------------------
-
 def fractional_difference_numpy(series, d, thresh=0.01):
+    """Applies fractional differencing to a time series."""
     w = [1.0]
     k = 1
     while True:
@@ -93,6 +94,7 @@ def fractional_difference_numpy(series, d, thresh=0.01):
     return np.concatenate((nan_padding, diff_series))
 
 def apply_frac_diff_fast(df, d):
+    """Applies fractional differencing to each column of a DataFrame."""
     frac_diff_df = pd.DataFrame(index=df.index)
     for col in df.columns:
         series = df[col].values
@@ -108,6 +110,7 @@ def apply_frac_diff_fast(df, d):
     return frac_diff_df
 
 async def fetch_ohlcv_with_retry(exchange, symbol, timeframe='1d', limit=90, max_retries=3, backoff_factor=1.0):
+    """Fetches OHLCV data with retry logic."""
     for attempt in range(1, max_retries + 1):
         try:
             ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -127,6 +130,7 @@ async def fetch_ohlcv_with_retry(exchange, symbol, timeframe='1d', limit=90, max
                 return None
 
 async def build_price_dataframe(exchange, symbols, timeframe='1d', limit=90):
+    """Builds a DataFrame of closing prices for the given symbols."""
     tasks = [fetch_ohlcv_with_retry(exchange, symbol, timeframe, limit) for symbol in symbols]
     close_prices = await asyncio.gather(*tasks)
     price_data = {}
@@ -140,6 +144,7 @@ async def build_price_dataframe(exchange, symbols, timeframe='1d', limit=90):
     return price_df
 
 def rolling_pca(df, window=28, n_components=2):
+    """Performs rolling PCA on the data."""
     pca = PCA(n_components=n_components)
     betas = []
     for t in range(window, len(df)):
@@ -151,6 +156,7 @@ def rolling_pca(df, window=28, n_components=2):
     return np.array(betas)
 
 def ekf_pca(betas, n_assets, n_components, Q_scale=1e-3, R_scale=1e-3):
+    """Smooths PCA betas using an Extended Kalman Filter."""
     num_steps = betas.shape[0]
     d_state = n_assets * n_components
     x = betas[0].flatten()
@@ -175,18 +181,16 @@ def ekf_pca(betas, n_assets, n_components, Q_scale=1e-3, R_scale=1e-3):
         b_hat[t] = x.reshape(n_assets, n_components)
     return b_hat
 
-def det_objective(omega, Q, B, Sigma):
+def det_objective(omega, Q, B, Sigma, bias_penalty):
+    """Objective function with bias correction."""
     q = Q - np.dot(B, omega)
+    residual_mean_penalty = bias_penalty * (np.mean(q) ** 2)
     diag_q = np.diag(q)
     residual_cov = diag_q @ Sigma @ diag_q
-    return np.linalg.det(residual_cov)
-
-# -------------------------------
-# Pipeline Async Function
-# -------------------------------
+    return np.linalg.det(residual_cov) + residual_mean_penalty
 
 async def run_pipeline_async():
-    # Connect to Kraken exchange
+    """Runs the entire hedging pipeline asynchronously."""
     exchange = ccxt.kraken({'enableRateLimit': True})
     try:
         markets = await exchange.load_markets()
@@ -194,56 +198,39 @@ async def run_pipeline_async():
     except Exception as e:
         logging.error(f"Error connecting to Kraken: {e}")
         return None, f"Error connecting to Kraken: {e}"
-    
-    # Filter symbols: Use USD pairs and exclude specific tokens
+
     all_symbols = list(markets.keys())
-    desired_quote_currencies = ["USD"]
-    unwanted_substrings = ['WBTC', 'USDC', 'BUSD', 'TUSD', 'DAI', 'UST', 'AUD', 'GBP', 'EUR']
-    filtered_symbols = [
-        symbol for symbol in all_symbols
-        if any(symbol.endswith(f'/{q}') for q in desired_quote_currencies)
-           and not any(excl in symbol for excl in unwanted_substrings)
-    ]
-    logging.info(f"Symbols after filtering: {len(filtered_symbols)}")
-    
-    price_df = await build_price_dataframe(exchange, filtered_symbols, timeframe=timeframe, limit=data_limit)
+    filtered_symbols = [symbol for symbol in all_symbols if symbol.endswith("/USD")]
+    price_df = await build_price_dataframe(exchange, filtered_symbols, timeframe, data_limit)
     await exchange.close()
-    
+
     if price_df.empty:
-        logging.error("Price DataFrame is empty. Exiting pipeline.")
         return None, "Price DataFrame is empty. Exiting pipeline."
-    
-    # Apply fractional differencing
+
     price_df_fd = apply_frac_diff_fast(price_df, frac_diff_d)
     price_df_fd.dropna(inplace=True)
+
     if price_df_fd.empty:
-        logging.error("No usable data after fractional differencing. Exiting pipeline.")
         return None, "No usable data after fractional differencing."
-    
-    # Standardize data
+
     scaler = StandardScaler()
     scaled_prices = scaler.fit_transform(price_df_fd)
     scaled_df = pd.DataFrame(scaled_prices, index=price_df_fd.index, columns=price_df_fd.columns)
-    logging.info("Data scaling completed.")
-    
-    # Rolling PCA
+
     betas = rolling_pca(scaled_df, window=rolling_window, n_components=2)
     if betas.size == 0:
-        logging.error("No rolling PCA betas computed – insufficient data.")
         return None, "No rolling PCA betas computed – insufficient data."
-    
-    n_assets = betas.shape[1]
-    smoothed_betas = ekf_pca(betas, n_assets, 2, Q_scale=ekf_q_scale, R_scale=ekf_r_scale)
+
+    smoothed_betas = ekf_pca(betas, betas.shape[1], 2, Q_scale=ekf_q_scale, R_scale=ekf_r_scale)
     B_final = smoothed_betas[-1]
-    
     Q_t = scaled_df.iloc[-1].values
-    cov_matrix = np.cov(scaled_df.T) + 1e-8 * np.eye(n_assets)
-    
-    objective = lambda omega: det_objective(omega, Q_t, B_final, cov_matrix)
-    bounds = [(0.0, 1.0)] * 2
-    initial_omega = np.full(2, 0.5)
+    cov_matrix = np.cov(scaled_df.T) + 1e-8 * np.eye(betas.shape[1])
+
+    objective = lambda omega: det_objective(omega, Q_t, B_final, cov_matrix, bias_penalty)
+    bounds = [(-1.0, 2.0)] * B_final.shape[1]
+    initial_omega = np.full(B_final.shape[1], 0.5)
     result = minimize(objective, initial_omega, method='L-BFGS-B', bounds=bounds)
-    
+
     if result.success:
         optimal_omega = result.x
         residual_q = Q_t - np.dot(B_final, optimal_omega)
@@ -254,47 +241,39 @@ async def run_pipeline_async():
             'Residual_Position': residual_q
         })
         res_df['Abs_Residual'] = res_df['Residual_Position'].abs()
-        logging.info("Portfolio hedging optimization completed successfully.")
         return res_df, None
     else:
-        logging.error(f"Optimization failed: {result.message}")
         return None, f"Optimization failed: {result.message}"
 
 def run_pipeline():
+    """Wrapper to run the pipeline."""
     return asyncio.run(run_pipeline_async())
 
-# -------------------------------
-# App Tabs and Layout
-# -------------------------------
+# Streamlit Tabs for Layout
+tab_learn, tab_model, tab_residuals = st.tabs(["📚 Learn", "📊 Hedging Model", "🔬 Residual Analysis"])
 
-tab_learn, tab_model, tab_residuals, tab_quiz = st.tabs(["📚 Learn", "📊 Hedging Model", "🔬 Residual Analysis", "🧠 Quiz"])
-
+# Learn Tab
 with tab_learn:
-    st.header("Understanding Market-Making Portfolio Hedging with EKF-PCA")
+    st.header("Understanding Hedging with EKF-PCA")
     st.markdown("""
-    This application implements a portfolio hedging framework that involves:
-    
-    - **Fractional Differencing:** Stationarizes asset price series while preserving memory.
-    - **Rolling PCA:** Captures time-varying factor loadings (betas) over a rolling window.
-    - **EKF-PCA:** Uses an Extended Kalman Filter to smooth the PCA betas.
-    - **Hedge Optimization:** Finds optimal hedge ratios by minimizing the determinant of the residual covariance.
-    
-    Together, these techniques help adjust asset positions dynamically to mitigate portfolio risk.
+    This application implements a hedging framework using:
+    - **Fractional Differencing:** Makes the data stationary.
+    - **Rolling PCA:** Extracts dynamic factor loadings (betas).
+    - **EKF-PCA:** Smooths the factor loadings using an Extended Kalman Filter.
+    - **Hedge Optimization:** Minimizes the determinant of residual covariance.
     """)
 
+# Hedging Model Tab
 with tab_model:
-    st.header("Portfolio Hedging Model")
+    st.header("Run the Hedging Model")
     if st.button("Run Hedging Pipeline"):
-        with st.spinner("Running pipeline, please wait..."):
+        with st.spinner("Running pipeline..."):
             result_df, error_msg = run_pipeline()
         if error_msg:
             st.error(error_msg)
         else:
-            st.success("Hedging pipeline completed successfully!")
-            st.subheader("Optimization Results")
+            st.success("Pipeline completed successfully!")
             st.dataframe(result_df)
-            
-            # Bar chart for asset positions
             fig_bar = go.Figure(data=[
                 go.Bar(name='Original Position', x=result_df['Asset'], y=result_df['Original_Position']),
                 go.Bar(name='Hedged Position', x=result_df['Asset'], y=result_df['Hedged_Position']),
@@ -303,67 +282,16 @@ with tab_model:
             fig_bar.update_layout(barmode='group', title="Asset Positions")
             st.plotly_chart(fig_bar, use_container_width=True)
 
+# Residual Analysis Tab
 with tab_residuals:
     st.header("Residual Analysis")
-    st.markdown("Residuals represent the differences between the original and hedged positions. Analyzing these helps assess the effectiveness of the hedge.")
     if st.button("Show Residual Distribution"):
-        # For demonstration, run the pipeline again (in a real app, cache the results)
         result_df, error_msg = run_pipeline()
         if error_msg:
             st.error(error_msg)
         else:
             fig_hist = px.histogram(result_df, x='Residual_Position', nbins=20, title="Residual Distribution")
             st.plotly_chart(fig_hist, use_container_width=True)
-            
-            fig_scatter = px.scatter(result_df, x='Hedged_Position', y='Residual_Position', 
+            fig_scatter = px.scatter(result_df, x='Hedged_Position', y='Residual_Position',
                                      title="Hedged vs Residual Positions", trendline="ols")
             st.plotly_chart(fig_scatter, use_container_width=True)
-
-with tab_quiz:
-    st.header("Test Your Knowledge on Hedging Strategies")
-    questions = [
-        {
-            "question": "What is the purpose of fractional differencing in this pipeline?",
-            "options": [
-                "To stationarize the price series while preserving memory",
-                "To remove noise from the data",
-                "To compute a moving average"
-            ],
-            "correct": 0,
-            "explanation": "Fractional differencing is used to make a non-stationary series stationary while preserving the series' memory."
-        },
-        {
-            "question": "What does EKF-PCA accomplish in this hedging framework?",
-            "options": [
-                "It forecasts future prices",
-                "It smooths the time-varying beta estimates from rolling PCA",
-                "It calculates the optimal hedge ratio directly"
-            ],
-            "correct": 1,
-            "explanation": "EKF-PCA applies an Extended Kalman Filter to smooth the PCA beta estimates, reducing noise in the dynamic factors."
-        },
-        {
-            "question": "In the hedge optimization step, what is minimized?",
-            "options": [
-                "The sum of squared errors",
-                "The determinant of the residual covariance matrix",
-                "The absolute residuals"
-            ],
-            "correct": 1,
-            "explanation": "The optimization minimizes the determinant of the residual covariance matrix to determine the optimal hedge ratios."
-        }
-    ]
-    
-    for i, q in enumerate(questions):
-        st.subheader(f"Question {i+1}: {q['question']}")
-        user_answer = st.radio(f"Select your answer for Question {i+1}:", q['options'], key=f"q{i}")
-        if st.button(f"Check Answer for Question {i+1}", key=f"check{i}"):
-            if q['options'].index(user_answer) == q['correct']:
-                st.success("Correct! Great job!")
-            else:
-                st.error("Not quite. Let's learn from this!")
-            st.info(f"Explanation: {q['explanation']}")
-        st.write("---")
-
-st.sidebar.markdown("---")
-st.sidebar.info("This app fetches market data via Kraken using ccxt, processes it through fractional differencing, rolling PCA, and EKF-PCA, and performs hedge optimization to adjust portfolio positions.")
